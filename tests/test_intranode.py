@@ -22,20 +22,29 @@ def test_main(args: argparse.Namespace, num_sms: int, local_rank: int, num_ranks
     if local_rank == 0:
         print(f'[config] num_tokens={num_tokens}, hidden={hidden}, num_topk={num_topk}', flush=True)
 
-    # Random data
+    # Random data, 初始化为rank的值
     x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device='cuda') * rank
+    # 应该是用于存放结果
     x_pure_rand = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
     x_e4m3 = per_token_cast_to_fp8(x) if deep_ep.Buffer.is_sm90_compiled() else None
     x_e4m3 = (x_e4m3[0], x_e4m3[1].T.contiguous().T) if x_e4m3 is not None else None
+    # 可能避免为0, 因此+1, 并且这个scopes仅用于生成topk
     scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
+    # 生成topk_idx
     topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)[1]
+    # topk_weights也是初始化成rank的值, 方便校验 
     topk_weights = torch.ones((num_tokens, num_topk), dtype=torch.float32, device='cuda') * rank
+    # 应该是结果
     topk_weights_pure_rand = torch.randn((num_tokens, num_topk), dtype=torch.float32, device='cuda')
+    # 对应在哪个rank上
     rank_idx = topk_idx // (num_experts // num_ranks)
+    # 应该不会实际执行, 因为不会有等于-1的元素
     rank_idx.masked_fill_(topk_idx == -1, -1)
+    # 应该是计算每个token要发往哪些rank(一个rank可能会有多个expert), 这个数据进行了去重, 并且倒序排列
     inplace_unique(rank_idx, num_ranks)
 
     # Expert meta
+    # 计算每个expert需要处理多少个token
     num_tokens_per_expert = torch.zeros((num_experts, ), dtype=torch.int, device='cuda')
     for i in range(num_experts):
         num_tokens_per_expert[i] = (topk_idx == i).sum()
@@ -45,15 +54,23 @@ def test_main(args: argparse.Namespace, num_sms: int, local_rank: int, num_ranks
     # Rank layout meta
     num_tokens_per_rank = torch.empty((num_ranks, ), dtype=torch.int, device='cuda')
     token_idx_in_rank = torch.full((num_ranks, num_tokens), -1, dtype=torch.long, device='cuda')
+    # 遍历每个 rank
     for i in range(num_ranks):
+        # 计算当前 rank i 负责的 token 数量
         num_tokens_per_rank[i] = (rank_idx == i).sum()
+        # 每个token有没有发往当前rank
         token_sel = (rank_idx == i).max(dim=-1)[0]
+        # count和num_tokens_per_rank应该相等
         count = token_sel.sum().item()
+        # 获取那些选上的token的idx
         tokens = torch.sort(token_sel.to(torch.int), descending=True)[1]
+        # 重新按小到大排序
         tokens[:count] = torch.sort(tokens[:count])[0]
+        # 为当前 rank 中的 token 重新分配索引, 告知是第几个
         token_idx_in_rank[i][tokens[:count]] = torch.arange(count, dtype=torch.long, device='cuda')
     token_idx_in_rank = token_idx_in_rank.T.contiguous().to(torch.int)
     is_token_in_rank = token_idx_in_rank >= 0
+    # 全局信息, 上面仅是处理当前rank要发送的数据, 这个代表的是要处理的全部数据
     gbl_num_tokens_per_rank = num_tokens_per_rank.clone()
     dist.all_reduce(gbl_num_tokens_per_rank, group=group)
 

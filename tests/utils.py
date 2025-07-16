@@ -61,17 +61,47 @@ def per_token_cast_back(x_fp8: torch.Tensor, x_scales: torch.Tensor):
 
 
 def inplace_unique(x: torch.Tensor, num_slots: int):
+    """
+    对输入张量 x 的每一行进行去重，并在原地修改 x，使其每一行只包含唯一的元素。
+
+    参数:
+    x (torch.Tensor): 一个二维张量，其中每一行将被处理以包含唯一的元素。假设 x 的元素最初是非负整数，或 -1 表示无效条目。
+    num_slots (int): 一个整数，表示允许的最大唯一元素的数量。对于 x 中的每一行，它最多只包含 num_slots 个唯一元素。
+
+    操作过程:
+    - 将 x 中的所有无效元素（小于0的值）替换为 num_slots。
+    - 计算每一行中每个元素的出现次数。
+    - 按降序对这些计数进行排序，并获取其对应的索引。
+    - 将计数为 0 的索引替换为 -1，以标记它们为无效。
+    - 将处理后的唯一元素（最多 num_slots 个）填充回 x 的起始位置。
+
+    注意:
+    - 该函数在原地修改输入张量 x。
+    - 输入张量 x 的每一行最多只能有 num_slots 个唯一值。
+    """
+    # 确保输入张量 x 是二维的
     assert x.dim() == 2
+    # 创建一个掩码，用于标识 x 中小于 0 的元素
     mask = x < 0
+    # 将 x 中小于 0 的元素替换为 num_slots
     x_padded = x.masked_fill(mask, num_slots)
+    # 创建一个用于计数的直方图张量，尺寸为 (x.size(0), num_slots + 1)
     bin_count = torch.zeros((x.size(0), num_slots + 1), dtype=x.dtype, device=x.device)
+    # 计算每一行中每个元素的出现次数，并更新到 bin_count 中
     bin_count.scatter_add_(1, x_padded, torch.ones_like(x_padded))
+    # 去掉计数直方图中超出 num_slots 的部分
     bin_count = bin_count[:, :num_slots]
+    # 对每一行的计数进行降序排序，获取排序后的计数值和对应的索引
     sorted_bin_count, sorted_bin_idx = torch.sort(bin_count, dim=-1, descending=True)
+    # 将计数为 0 的位置对应的索引设置为 -1
     sorted_bin_idx.masked_fill_(sorted_bin_count == 0, -1)
+    # 对索引进行再次排序，确保唯一值的顺序
     sorted_bin_idx = torch.sort(sorted_bin_idx, descending=True, dim=-1).values
+    # 将 x 的所有元素填充为 -1
     x[:, :].fill_(-1)
+    # 确定有效长度，不能超过 num_slots 或 x 的列数
     valid_len = min(num_slots, x.size(1))
+    # 将处理后的唯一元素填充回 x，最多填充 valid_len 个元素, x的后面可能会有-1
     x[:, :valid_len] = sorted_bin_idx[:, :valid_len]
 
 
